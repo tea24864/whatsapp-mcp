@@ -56,9 +56,15 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	dsn := "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=10000"
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to ping message database: %v", err)
 	}
 
 	// Create tables if they don't exist
@@ -86,11 +92,18 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp ON messages(chat_jid, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_sender_timestamp ON messages(sender, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_chats_last_message_time ON chats(last_message_time);
 	`)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	return &MessageStore{db: db}, nil
 }
@@ -174,6 +187,708 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+const apiTimeLayout = "2006-01-02T15:04:05.999999999-07:00"
+
+func formatAPITime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(apiTimeLayout)
+}
+
+func parseAPITime(s string) (time.Time, error) {
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	}
+
+	for _, layout := range layouts {
+		if strings.Contains(layout, "Z07:00") {
+			parsed, err := time.Parse(layout, s)
+			if err == nil {
+				return parsed, nil
+			}
+			continue
+		}
+
+		parsed, err := time.ParseInLocation(layout, s, time.UTC)
+		if err == nil {
+			return parsed, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("invalid time format: %s", s)
+}
+
+func normalizeLimit(limit int, defaultLimit int, maxLimit int) int {
+	if limit <= 0 {
+		return defaultLimit
+	}
+	if limit > maxLimit {
+		return maxLimit
+	}
+	return limit
+}
+
+func normalizePage(page int) int {
+	if page < 0 {
+		return 0
+	}
+	return page
+}
+
+func (store *MessageStore) GetSenderName(senderJID string) (string, error) {
+	var name string
+
+	err := store.db.QueryRow("SELECT name FROM chats WHERE jid = ? LIMIT 1", senderJID).Scan(&name)
+	if err == nil && name != "" {
+		return name, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+
+	phonePart := senderJID
+	if strings.Contains(senderJID, "@") {
+		phonePart = strings.SplitN(senderJID, "@", 2)[0]
+	}
+
+	pattern := "%" + phonePart + "%"
+	err = store.db.QueryRow("SELECT name FROM chats WHERE jid LIKE ? LIMIT 1", pattern).Scan(&name)
+	if err == nil && name != "" {
+		return name, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+
+	return "", nil
+}
+
+func (store *MessageStore) SearchContacts(query string) ([]ContactDTO, error) {
+	pattern := "%" + query + "%"
+	rows, err := store.db.Query(
+		`SELECT DISTINCT jid, name
+		 FROM chats
+		 WHERE (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+		   AND jid NOT LIKE '%@g.us'
+		 ORDER BY name, jid
+		 LIMIT 50`,
+		pattern, pattern,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var contacts []ContactDTO
+	for rows.Next() {
+		var jid string
+		var name sql.NullString
+		if err := rows.Scan(&jid, &name); err != nil {
+			return nil, err
+		}
+
+		phone := jid
+		if strings.Contains(jid, "@") {
+			phone = strings.SplitN(jid, "@", 2)[0]
+		}
+
+		c := ContactDTO{PhoneNumber: phone, JID: jid}
+		if name.Valid {
+			c.Name = name.String
+		}
+		contacts = append(contacts, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return contacts, nil
+}
+
+func (store *MessageStore) ListChats(query string, limit int, page int, includeLastMessage bool, sortBy string) ([]ChatDTO, error) {
+	limit = normalizeLimit(limit, 20, 100)
+	page = normalizePage(page)
+	offset := page * limit
+
+	var qb strings.Builder
+	qb.WriteString("SELECT chats.jid, chats.name, chats.last_message_time")
+	if includeLastMessage {
+		qb.WriteString(", messages.content as last_message, messages.sender as last_sender, messages.is_from_me as last_is_from_me")
+	} else {
+		qb.WriteString(", NULL as last_message, NULL as last_sender, NULL as last_is_from_me")
+	}
+	qb.WriteString(" FROM chats")
+	if includeLastMessage {
+		qb.WriteString(" LEFT JOIN messages ON chats.jid = messages.chat_jid AND chats.last_message_time = messages.timestamp")
+	}
+
+	params := make([]any, 0, 4)
+	if query != "" {
+		qb.WriteString(" WHERE (LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+		pattern := "%" + query + "%"
+		params = append(params, pattern, pattern)
+	}
+
+	orderBy := "chats.last_message_time DESC"
+	if sortBy == "name" {
+		orderBy = "chats.name"
+	}
+	qb.WriteString(" ORDER BY " + orderBy)
+	qb.WriteString(" LIMIT ? OFFSET ?")
+	params = append(params, limit, offset)
+
+	rows, err := store.db.Query(qb.String(), params...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ChatDTO
+	for rows.Next() {
+		var jid string
+		var name sql.NullString
+		var lastMessageTime sql.NullTime
+		var lastMessage sql.NullString
+		var lastSender sql.NullString
+		var lastIsFromMe sql.NullBool
+		if err := rows.Scan(&jid, &name, &lastMessageTime, &lastMessage, &lastSender, &lastIsFromMe); err != nil {
+			return nil, err
+		}
+
+		c := ChatDTO{JID: jid}
+		if name.Valid {
+			c.Name = name.String
+		}
+		if lastMessageTime.Valid {
+			c.LastMessageTime = formatAPITime(lastMessageTime.Time)
+		}
+		if lastMessage.Valid {
+			c.LastMessage = lastMessage.String
+		}
+		if lastSender.Valid {
+			c.LastSender = lastSender.String
+		}
+		if lastIsFromMe.Valid {
+			v := lastIsFromMe.Bool
+			c.LastIsFromMe = &v
+		}
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (store *MessageStore) GetChat(chatJID string, includeLastMessage bool) (*ChatDTO, error) {
+	req := ListChatsRequest{IncludeLastMessage: includeLastMessage}
+	_ = req
+
+	query := "SELECT c.jid, c.name, c.last_message_time"
+	if includeLastMessage {
+		query += ", m.content as last_message, m.sender as last_sender, m.is_from_me as last_is_from_me"
+	} else {
+		query += ", NULL as last_message, NULL as last_sender, NULL as last_is_from_me"
+	}
+	query += " FROM chats c"
+	if includeLastMessage {
+		query += " LEFT JOIN messages m ON c.jid = m.chat_jid AND c.last_message_time = m.timestamp"
+	}
+	query += " WHERE c.jid = ?"
+
+	var jid string
+	var name sql.NullString
+	var lastMessageTime sql.NullTime
+	var lastMessage sql.NullString
+	var lastSender sql.NullString
+	var lastIsFromMe sql.NullBool
+	err := store.db.QueryRow(query, chatJID).Scan(&jid, &name, &lastMessageTime, &lastMessage, &lastSender, &lastIsFromMe)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	c := &ChatDTO{JID: jid}
+	if name.Valid {
+		c.Name = name.String
+	}
+	if lastMessageTime.Valid {
+		c.LastMessageTime = formatAPITime(lastMessageTime.Time)
+	}
+	if lastMessage.Valid {
+		c.LastMessage = lastMessage.String
+	}
+	if lastSender.Valid {
+		c.LastSender = lastSender.String
+	}
+	if lastIsFromMe.Valid {
+		v := lastIsFromMe.Bool
+		c.LastIsFromMe = &v
+	}
+	return c, nil
+}
+
+func (store *MessageStore) GetDirectChatByContact(senderPhoneNumber string) (*ChatDTO, error) {
+	pattern := "%" + senderPhoneNumber + "%"
+	query := `SELECT c.jid, c.name, c.last_message_time,
+		       m.content as last_message, m.sender as last_sender, m.is_from_me as last_is_from_me
+		  FROM chats c
+		  LEFT JOIN messages m ON c.jid = m.chat_jid AND c.last_message_time = m.timestamp
+		 WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+		 LIMIT 1`
+
+	var jid string
+	var name sql.NullString
+	var lastMessageTime sql.NullTime
+	var lastMessage sql.NullString
+	var lastSender sql.NullString
+	var lastIsFromMe sql.NullBool
+	err := store.db.QueryRow(query, pattern).Scan(&jid, &name, &lastMessageTime, &lastMessage, &lastSender, &lastIsFromMe)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	c := &ChatDTO{JID: jid}
+	if name.Valid {
+		c.Name = name.String
+	}
+	if lastMessageTime.Valid {
+		c.LastMessageTime = formatAPITime(lastMessageTime.Time)
+	}
+	if lastMessage.Valid {
+		c.LastMessage = lastMessage.String
+	}
+	if lastSender.Valid {
+		c.LastSender = lastSender.String
+	}
+	if lastIsFromMe.Valid {
+		v := lastIsFromMe.Bool
+		c.LastIsFromMe = &v
+	}
+	return c, nil
+}
+
+func (store *MessageStore) GetContactChats(jid string, limit int, page int) ([]ChatDTO, error) {
+	limit = normalizeLimit(limit, 20, 100)
+	page = normalizePage(page)
+	offset := page * limit
+
+	query := `SELECT DISTINCT
+		       c.jid,
+		       c.name,
+		       c.last_message_time,
+		       m.content as last_message,
+		       m.sender as last_sender,
+		       m.is_from_me as last_is_from_me
+		  FROM chats c
+		  JOIN messages m ON c.jid = m.chat_jid
+		 WHERE m.sender = ? OR c.jid = ?
+		 ORDER BY c.last_message_time DESC
+		 LIMIT ? OFFSET ?`
+
+	rows, err := store.db.Query(query, jid, jid, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ChatDTO
+	for rows.Next() {
+		var chatJID string
+		var name sql.NullString
+		var lastMessageTime sql.NullTime
+		var lastMessage sql.NullString
+		var lastSender sql.NullString
+		var lastIsFromMe sql.NullBool
+		if err := rows.Scan(&chatJID, &name, &lastMessageTime, &lastMessage, &lastSender, &lastIsFromMe); err != nil {
+			return nil, err
+		}
+
+		c := ChatDTO{JID: chatJID}
+		if name.Valid {
+			c.Name = name.String
+		}
+		if lastMessageTime.Valid {
+			c.LastMessageTime = formatAPITime(lastMessageTime.Time)
+		}
+		if lastMessage.Valid {
+			c.LastMessage = lastMessage.String
+		}
+		if lastSender.Valid {
+			c.LastSender = lastSender.String
+		}
+		if lastIsFromMe.Valid {
+			v := lastIsFromMe.Bool
+			c.LastIsFromMe = &v
+		}
+
+		out = append(out, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (store *MessageStore) GetLastInteraction(jid string) (*MessageDTO, error) {
+	query := `SELECT 
+		       m.timestamp,
+		       m.sender,
+		       c.name,
+		       m.content,
+		       m.is_from_me,
+		       c.jid,
+		       m.id,
+		       m.media_type,
+		       m.filename
+		  FROM messages m
+		  JOIN chats c ON m.chat_jid = c.jid
+		 WHERE m.sender = ? OR c.jid = ?
+		 ORDER BY m.timestamp DESC
+		 LIMIT 1`
+
+	var ts time.Time
+	var sender string
+	var chatName sql.NullString
+	var content sql.NullString
+	var isFromMe bool
+	var chatJID string
+	var id string
+	var mediaType sql.NullString
+	var filename sql.NullString
+	err := store.db.QueryRow(query, jid, jid).Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &mediaType, &filename)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	m := &MessageDTO{
+		ID:        id,
+		ChatJID:   chatJID,
+		Timestamp: formatAPITime(ts),
+		Sender:    sender,
+		IsFromMe:  isFromMe,
+	}
+	if chatName.Valid {
+		m.ChatName = chatName.String
+	}
+	if content.Valid {
+		m.Content = content.String
+	}
+	if mediaType.Valid {
+		m.MediaType = mediaType.String
+	}
+	if filename.Valid {
+		m.Filename = filename.String
+	}
+	return m, nil
+}
+
+func (store *MessageStore) GetMessageContext(messageID string, chatJID string, before int, after int) (*MessageContextDTO, error) {
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 {
+		after = 0
+	}
+	if before > 50 {
+		before = 50
+	}
+	if after > 50 {
+		after = 50
+	}
+
+	baseQuery := `SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.chat_jid, m.media_type, m.filename
+		         FROM messages m
+		         JOIN chats c ON m.chat_jid = c.jid`
+
+	var row *sql.Row
+	if chatJID != "" {
+		row = store.db.QueryRow(baseQuery+" WHERE m.id = ? AND m.chat_jid = ? LIMIT 1", messageID, chatJID)
+	} else {
+		row = store.db.QueryRow(baseQuery+" WHERE m.id = ? ORDER BY m.timestamp DESC LIMIT 1", messageID)
+	}
+
+	var ts time.Time
+	var sender string
+	var chatName sql.NullString
+	var content sql.NullString
+	var isFromMe bool
+	var chatJIDResolved string
+	var id string
+	var chatJIDFromMsg string
+	var mediaType sql.NullString
+	var filename sql.NullString
+	err := row.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJIDResolved, &id, &chatJIDFromMsg, &mediaType, &filename)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	msg := MessageDTO{
+		ID:        id,
+		ChatJID:   chatJIDFromMsg,
+		Timestamp: formatAPITime(ts),
+		Sender:    sender,
+		IsFromMe:  isFromMe,
+	}
+	if chatName.Valid {
+		msg.ChatName = chatName.String
+	}
+	if content.Valid {
+		msg.Content = content.String
+	}
+	if mediaType.Valid {
+		msg.MediaType = mediaType.String
+	}
+	if filename.Valid {
+		msg.Filename = filename.String
+	}
+
+	name, err := store.GetSenderName(sender)
+	if err == nil && name != "" {
+		msg.SenderName = name
+	}
+
+	beforeRows, err := store.db.Query(
+		`SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, m.filename
+		   FROM messages m
+		   JOIN chats c ON m.chat_jid = c.jid
+		  WHERE m.chat_jid = ? AND m.timestamp < ?
+		  ORDER BY m.timestamp DESC
+		  LIMIT ?`,
+		chatJIDFromMsg, ts, before,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer beforeRows.Close()
+
+	beforeMsgs := make([]MessageDTO, 0, before)
+	for beforeRows.Next() {
+		var bts time.Time
+		var bsender string
+		var bchatName sql.NullString
+		var bcontent sql.NullString
+		var bisFromMe bool
+		var bchatJID string
+		var bid string
+		var bmediaType sql.NullString
+		var bfilename sql.NullString
+		if err := beforeRows.Scan(&bts, &bsender, &bchatName, &bcontent, &bisFromMe, &bchatJID, &bid, &bmediaType, &bfilename); err != nil {
+			return nil, err
+		}
+		m := MessageDTO{ID: bid, ChatJID: bchatJID, Timestamp: formatAPITime(bts), Sender: bsender, IsFromMe: bisFromMe}
+		if bchatName.Valid {
+			m.ChatName = bchatName.String
+		}
+		if bcontent.Valid {
+			m.Content = bcontent.String
+		}
+		if bmediaType.Valid {
+			m.MediaType = bmediaType.String
+		}
+		if bfilename.Valid {
+			m.Filename = bfilename.String
+		}
+		if name, err := store.GetSenderName(bsender); err == nil && name != "" {
+			m.SenderName = name
+		}
+		beforeMsgs = append(beforeMsgs, m)
+	}
+	if err := beforeRows.Err(); err != nil {
+		return nil, err
+	}
+
+	afterRows, err := store.db.Query(
+		`SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, m.filename
+		   FROM messages m
+		   JOIN chats c ON m.chat_jid = c.jid
+		  WHERE m.chat_jid = ? AND m.timestamp > ?
+		  ORDER BY m.timestamp ASC
+		  LIMIT ?`,
+		chatJIDFromMsg, ts, after,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer afterRows.Close()
+
+	afterMsgs := make([]MessageDTO, 0, after)
+	for afterRows.Next() {
+		var ats time.Time
+		var asender string
+		var achatName sql.NullString
+		var acontent sql.NullString
+		var aisFromMe bool
+		var achatJID string
+		var aid string
+		var amediaType sql.NullString
+		var afilename sql.NullString
+		if err := afterRows.Scan(&ats, &asender, &achatName, &acontent, &aisFromMe, &achatJID, &aid, &amediaType, &afilename); err != nil {
+			return nil, err
+		}
+		m := MessageDTO{ID: aid, ChatJID: achatJID, Timestamp: formatAPITime(ats), Sender: asender, IsFromMe: aisFromMe}
+		if achatName.Valid {
+			m.ChatName = achatName.String
+		}
+		if acontent.Valid {
+			m.Content = acontent.String
+		}
+		if amediaType.Valid {
+			m.MediaType = amediaType.String
+		}
+		if afilename.Valid {
+			m.Filename = afilename.String
+		}
+		if name, err := store.GetSenderName(asender); err == nil && name != "" {
+			m.SenderName = name
+		}
+		afterMsgs = append(afterMsgs, m)
+	}
+	if err := afterRows.Err(); err != nil {
+		return nil, err
+	}
+
+	ctx := &MessageContextDTO{Message: msg, Before: beforeMsgs, After: afterMsgs}
+	return ctx, nil
+}
+
+func (store *MessageStore) ListMessages(req ListMessagesRequest) ([]MessageDTO, error) {
+	limit := normalizeLimit(req.Limit, 20, 100)
+	page := normalizePage(req.Page)
+	offset := page * limit
+	includeContext := req.IncludeContext
+	contextBefore := req.ContextBefore
+	contextAfter := req.ContextAfter
+	if contextBefore <= 0 {
+		contextBefore = 1
+	}
+	if contextAfter <= 0 {
+		contextAfter = 1
+	}
+
+	var qb strings.Builder
+	qb.WriteString("SELECT m.timestamp, m.sender, c.name, m.content, m.is_from_me, c.jid, m.id, m.media_type, m.filename FROM messages m")
+	qb.WriteString(" JOIN chats c ON m.chat_jid = c.jid")
+
+	where := make([]string, 0, 5)
+	params := make([]any, 0, 7)
+
+	if req.After != "" {
+		t, err := parseAPITime(req.After)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "m.timestamp > ?")
+		params = append(params, t)
+	}
+	if req.Before != "" {
+		t, err := parseAPITime(req.Before)
+		if err != nil {
+			return nil, err
+		}
+		where = append(where, "m.timestamp < ?")
+		params = append(params, t)
+	}
+	if req.SenderPhoneNumber != "" {
+		where = append(where, "m.sender = ?")
+		params = append(params, req.SenderPhoneNumber)
+	}
+	if req.ChatJID != "" {
+		where = append(where, "m.chat_jid = ?")
+		params = append(params, req.ChatJID)
+	}
+	if req.Query != "" {
+		where = append(where, "LOWER(m.content) LIKE LOWER(?)")
+		params = append(params, "%"+req.Query+"%")
+	}
+	if len(where) > 0 {
+		qb.WriteString(" WHERE " + strings.Join(where, " AND "))
+	}
+	qb.WriteString(" ORDER BY m.timestamp DESC, m.id DESC, m.chat_jid DESC")
+	qb.WriteString(" LIMIT ? OFFSET ?")
+	params = append(params, limit, offset)
+
+	rows, err := store.db.Query(qb.String(), params...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	base := make([]MessageDTO, 0, limit)
+	for rows.Next() {
+		var ts time.Time
+		var sender string
+		var chatName sql.NullString
+		var content sql.NullString
+		var isFromMe bool
+		var chatJID string
+		var id string
+		var mediaType sql.NullString
+		var filename sql.NullString
+		if err := rows.Scan(&ts, &sender, &chatName, &content, &isFromMe, &chatJID, &id, &mediaType, &filename); err != nil {
+			return nil, err
+		}
+
+		m := MessageDTO{ID: id, ChatJID: chatJID, Timestamp: formatAPITime(ts), Sender: sender, IsFromMe: isFromMe}
+		if chatName.Valid {
+			m.ChatName = chatName.String
+		}
+		if content.Valid {
+			m.Content = content.String
+		}
+		if mediaType.Valid {
+			m.MediaType = mediaType.String
+		}
+		if filename.Valid {
+			m.Filename = filename.String
+		}
+		if name, err := store.GetSenderName(sender); err == nil && name != "" {
+			m.SenderName = name
+		}
+
+		base = append(base, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	if !includeContext {
+		return base, nil
+	}
+
+	out := make([]MessageDTO, 0, len(base)*(1+contextBefore+contextAfter))
+	for _, m := range base {
+		ctx, err := store.GetMessageContext(m.ID, m.ChatJID, contextBefore, contextAfter)
+		if err != nil {
+			return nil, err
+		}
+		if ctx == nil {
+			continue
+		}
+		out = append(out, ctx.Before...)
+		out = append(out, ctx.Message)
+		out = append(out, ctx.After...)
+	}
+
+	return out, nil
+}
+
 // Extract text content from a message
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
@@ -193,13 +908,11 @@ func extractTextContent(msg *waProto.Message) string {
 
 const apiKeyHeader = "X-API-Key"
 
-// SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
 }
 
-// SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
@@ -474,18 +1187,149 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 }
 
-// DownloadMediaRequest represents the request body for the download media API
 type DownloadMediaRequest struct {
 	MessageID string `json:"message_id"`
 	ChatJID   string `json:"chat_jid"`
 }
 
-// DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
 	Success  bool   `json:"success"`
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
+}
+
+type MessageDTO struct {
+	ID         string `json:"id"`
+	ChatJID    string `json:"chat_jid"`
+	ChatName   string `json:"chat_name,omitempty"`
+	Timestamp  string `json:"timestamp"`
+	Sender     string `json:"sender"`
+	SenderName string `json:"sender_name,omitempty"`
+	Content    string `json:"content"`
+	IsFromMe   bool   `json:"is_from_me"`
+	MediaType  string `json:"media_type,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+}
+
+type ChatDTO struct {
+	JID             string `json:"jid"`
+	Name            string `json:"name,omitempty"`
+	LastMessageTime string `json:"last_message_time,omitempty"`
+	LastMessage     string `json:"last_message,omitempty"`
+	LastSender      string `json:"last_sender,omitempty"`
+	LastIsFromMe    *bool  `json:"last_is_from_me,omitempty"`
+}
+
+type ContactDTO struct {
+	PhoneNumber string `json:"phone_number"`
+	Name        string `json:"name,omitempty"`
+	JID         string `json:"jid"`
+}
+
+type MessageContextDTO struct {
+	Message MessageDTO   `json:"message"`
+	Before  []MessageDTO `json:"before"`
+	After   []MessageDTO `json:"after"`
+}
+
+type SearchContactsRequest struct {
+	Query string `json:"query"`
+}
+
+type SearchContactsResponse struct {
+	Success  bool         `json:"success"`
+	Message  string       `json:"message,omitempty"`
+	Contacts []ContactDTO `json:"contacts"`
+}
+
+type ListChatsRequest struct {
+	Query              string `json:"query,omitempty"`
+	Limit              int    `json:"limit,omitempty"`
+	Page               int    `json:"page,omitempty"`
+	IncludeLastMessage bool   `json:"include_last_message,omitempty"`
+	SortBy             string `json:"sort_by,omitempty"`
+}
+
+type ListChatsResponse struct {
+	Success bool      `json:"success"`
+	Message string    `json:"message,omitempty"`
+	Chats   []ChatDTO `json:"chats"`
+}
+
+type GetChatRequest struct {
+	ChatJID            string `json:"chat_jid"`
+	IncludeLastMessage bool   `json:"include_last_message,omitempty"`
+}
+
+type GetChatResponse struct {
+	Success bool     `json:"success"`
+	Message string   `json:"message,omitempty"`
+	Chat    *ChatDTO `json:"chat"`
+}
+
+type GetDirectChatByContactRequest struct {
+	SenderPhoneNumber string `json:"sender_phone_number"`
+}
+
+type GetDirectChatByContactResponse struct {
+	Success bool     `json:"success"`
+	Message string   `json:"message,omitempty"`
+	Chat    *ChatDTO `json:"chat"`
+}
+
+type GetContactChatsRequest struct {
+	JID   string `json:"jid"`
+	Limit int    `json:"limit,omitempty"`
+	Page  int    `json:"page,omitempty"`
+}
+
+type GetContactChatsResponse struct {
+	Success bool      `json:"success"`
+	Message string    `json:"message,omitempty"`
+	Chats   []ChatDTO `json:"chats"`
+}
+
+type GetLastInteractionRequest struct {
+	JID string `json:"jid"`
+}
+
+type GetLastInteractionResponse struct {
+	Success bool        `json:"success"`
+	Message string      `json:"message,omitempty"`
+	Last    *MessageDTO `json:"last"`
+}
+
+type ListMessagesRequest struct {
+	After             string `json:"after,omitempty"`
+	Before            string `json:"before,omitempty"`
+	SenderPhoneNumber string `json:"sender_phone_number,omitempty"`
+	ChatJID           string `json:"chat_jid,omitempty"`
+	Query             string `json:"query,omitempty"`
+	Limit             int    `json:"limit,omitempty"`
+	Page              int    `json:"page,omitempty"`
+	IncludeContext    bool   `json:"include_context,omitempty"`
+	ContextBefore     int    `json:"context_before,omitempty"`
+	ContextAfter      int    `json:"context_after,omitempty"`
+}
+
+type ListMessagesResponse struct {
+	Success  bool         `json:"success"`
+	Message  string       `json:"message,omitempty"`
+	Messages []MessageDTO `json:"messages"`
+}
+
+type GetMessageContextRequest struct {
+	MessageID string `json:"message_id"`
+	ChatJID   string `json:"chat_jid,omitempty"`
+	Before    int    `json:"before,omitempty"`
+	After     int    `json:"after,omitempty"`
+}
+
+type GetMessageContextResponse struct {
+	Success bool               `json:"success"`
+	Message string             `json:"message,omitempty"`
+	Context *MessageContextDTO `json:"context"`
 }
 
 func requireAPIKey(apiKey string, w http.ResponseWriter, r *http.Request, logger waLog.Logger) bool {
@@ -764,6 +1608,246 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	http.HandleFunc("/api/search-contacts", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req SearchContactsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		contacts, err := messageStore.SearchContacts(req.Query)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(SearchContactsResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err)})
+			return
+		}
+
+		json.NewEncoder(w).Encode(SearchContactsResponse{Success: true, Contacts: contacts})
+	})
+
+	http.HandleFunc("/api/list-chats", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ListChatsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		chats, err := messageStore.ListChats(req.Query, req.Limit, req.Page, req.IncludeLastMessage, req.SortBy)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ListChatsResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err)})
+			return
+		}
+
+		json.NewEncoder(w).Encode(ListChatsResponse{Success: true, Chats: chats})
+	})
+
+	http.HandleFunc("/api/get-chat", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req GetChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		chat, err := messageStore.GetChat(req.ChatJID, req.IncludeLastMessage)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetChatResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err), Chat: nil})
+			return
+		}
+
+		json.NewEncoder(w).Encode(GetChatResponse{Success: true, Chat: chat})
+	})
+
+	http.HandleFunc("/api/get-direct-chat-by-contact", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req GetDirectChatByContactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.SenderPhoneNumber == "" {
+			http.Error(w, "sender_phone_number is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		chat, err := messageStore.GetDirectChatByContact(req.SenderPhoneNumber)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetDirectChatByContactResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err), Chat: nil})
+			return
+		}
+
+		json.NewEncoder(w).Encode(GetDirectChatByContactResponse{Success: true, Chat: chat})
+	})
+
+	http.HandleFunc("/api/get-contact-chats", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req GetContactChatsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.JID == "" {
+			http.Error(w, "jid is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		chats, err := messageStore.GetContactChats(req.JID, req.Limit, req.Page)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetContactChatsResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err), Chats: nil})
+			return
+		}
+
+		json.NewEncoder(w).Encode(GetContactChatsResponse{Success: true, Chats: chats})
+	})
+
+	http.HandleFunc("/api/get-last-interaction", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req GetLastInteractionRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.JID == "" {
+			http.Error(w, "jid is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		last, err := messageStore.GetLastInteraction(req.JID)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetLastInteractionResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err), Last: nil})
+			return
+		}
+
+		json.NewEncoder(w).Encode(GetLastInteractionResponse{Success: true, Last: last})
+	})
+
+	http.HandleFunc("/api/list-messages", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ListMessagesRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		messages, err := messageStore.ListMessages(req)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ListMessagesResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err), Messages: nil})
+			return
+		}
+
+		json.NewEncoder(w).Encode(ListMessagesResponse{Success: true, Messages: messages})
+	})
+
+	http.HandleFunc("/api/get-message-context", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req GetMessageContextRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.MessageID == "" {
+			http.Error(w, "message_id is required", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+
+		context, err := messageStore.GetMessageContext(req.MessageID, req.ChatJID, req.Before, req.After)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GetMessageContextResponse{Success: false, Message: fmt.Sprintf("Database error: %v", err), Context: nil})
+			return
+		}
+
+		json.NewEncoder(w).Encode(GetMessageContextResponse{Success: true, Context: context})
 	})
 
 	// Handler for downloading media

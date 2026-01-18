@@ -19,14 +19,13 @@ Two-component system:
 
 2. **Python MCP Server** (`whatsapp-mcp-server/`):
    - FastMCP-based server implementing MCP protocol
-   - Queries SQLite database directly for reads
-   - Calls Go bridge HTTP API for writes (send message, download media)
+   - Calls Go bridge HTTPS API for reads and writes
    - Communicates with Claude/Cursor via stdio transport
 
 ### Data Flow
 
-- **Reading**: MCP Server → SQLite database → Return results
-- **Sending**: MCP Server → Go bridge HTTP API → WhatsApp API
+- **Reading**: MCP Server → Go bridge HTTPS API → SQLite database → Return results
+- **Sending**: MCP Server → Go bridge HTTPS API → WhatsApp API
 - **Receiving**: WhatsApp API → Go bridge → SQLite database → Available to MCP Server
 
 ### Database Schema
@@ -115,11 +114,19 @@ The `list_messages` function supports context retrieval:
 
 ### HTTP API Endpoints
 
-Go bridge exposes localhost:8080/api endpoints:
-- `/api/send`: POST with recipient and message
-- `/api/send-file`: POST with recipient and media_path
-- `/api/send-audio`: POST with recipient and media_path
-- `/api/download`: POST with message_id and chat_jid
+Go bridge exposes localhost:8080/api endpoints (all POST; auth via `X-API-Key`):
+- `/api/send`: recipient + message/media_path
+- `/api/download`: message_id + chat_jid
+
+Read endpoints:
+- `/api/search-contacts`: query
+- `/api/list-chats`: query/limit/page/include_last_message/sort_by
+- `/api/get-chat`: chat_jid/include_last_message
+- `/api/get-direct-chat-by-contact`: sender_phone_number
+- `/api/get-contact-chats`: jid/limit/page
+- `/api/get-last-interaction`: jid
+- `/api/list-messages`: after/before/sender_phone_number/chat_jid/query/limit/page/include_context/context_before/context_after
+- `/api/get-message-context`: message_id/chat_jid(optional)/before/after
 
 ## MCP Tools Available
 
