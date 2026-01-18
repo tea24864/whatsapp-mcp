@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -10,6 +12,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -17,10 +20,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -188,6 +190,8 @@ func extractTextContent(msg *waProto.Message) string {
 	// For now, we're ignoring non-text messages
 	return ""
 }
+
+const apiKeyHeader = "X-API-Key"
 
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
@@ -484,6 +488,28 @@ type DownloadMediaResponse struct {
 	Path     string `json:"path,omitempty"`
 }
 
+func requireAPIKey(apiKey string, w http.ResponseWriter, r *http.Request, logger waLog.Logger) bool {
+	if apiKey == "" {
+		http.Error(w, "API key is not configured", http.StatusInternalServerError)
+		return false
+	}
+
+	provided := r.Header.Get(apiKeyHeader)
+	if provided == "" {
+		logger.Warnf("AUTHZ_DENIED")
+		http.Error(w, "Missing API key", http.StatusUnauthorized)
+		return false
+	}
+
+	if subtle.ConstantTimeCompare([]byte(provided), []byte(apiKey)) != 1 {
+		logger.Warnf("AUTHZ_DENIED")
+		http.Error(w, "Invalid API key", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
+}
+
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -641,7 +667,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -676,9 +702,26 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, apiKey string, tlsCertPath string, tlsKeyPath string, logger waLog.Logger) {
+	if tlsCertPath == "" || tlsKeyPath == "" {
+		fmt.Println("TLS certificate or key path is missing; HTTPS server not started")
+		return
+	}
+
+	if _, err := os.Stat(tlsCertPath); err != nil {
+		fmt.Printf("TLS certificate not found at %s: %v\n", tlsCertPath, err)
+		return
+	}
+
+	if _, err := os.Stat(tlsKeyPath); err != nil {
+		fmt.Printf("TLS key not found at %s: %v\n", tlsKeyPath, err)
+		return
+	}
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -725,6 +768,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAPIKey(apiKey, w, r, logger) {
+			return
+		}
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -776,11 +822,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	fmt.Printf("Starting REST API server on https://localhost%s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServeTLS(serverAddr, tlsCertPath, tlsKeyPath, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -791,6 +837,10 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
+	if err := godotenv.Load(); err != nil {
+		logger.Infof("No .env file loaded: %v", err)
+	}
+
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -800,14 +850,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -905,8 +955,23 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	apiKey := os.Getenv("WHATSAPP_BRIDGE_API_KEY")
+	if apiKey == "" {
+		logger.Errorf("WHATSAPP_BRIDGE_API_KEY is not set; refusing to start REST API server")
+		return
+	}
+
+	tlsCertPath := os.Getenv("WHATSAPP_BRIDGE_TLS_CERT")
+	tlsKeyPath := os.Getenv("WHATSAPP_BRIDGE_TLS_KEY")
+	if tlsCertPath == "" {
+		tlsCertPath = "store/server.crt"
+	}
+	if tlsKeyPath == "" {
+		tlsKeyPath = "store/server.key"
+	}
+
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, 8080, apiKey, tlsCertPath, tlsKeyPath, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1038,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1053,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
