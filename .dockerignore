@@ -1,0 +1,9 @@
+store/
+store-root-backup-*/
+.git/
+.claude/
+.ruff_cache/
+*.db
+*.db-wal
+*.db-shm
+whatsapp.log

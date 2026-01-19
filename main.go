@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -24,7 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 
@@ -912,8 +910,6 @@ func extractTextContent(msg *waProto.Message) string {
 	return ""
 }
 
-const apiKeyHeader = "X-API-Key"
-
 const defaultListenAddr = ":8080"
 const defaultMCPPath = "/mcp"
 const defaultMediaPathPrefix = "/media"
@@ -1456,41 +1452,6 @@ type GetMessageContextResponse struct {
 	Context *MessageContextDTO `json:"context"`
 }
 
-func requireAPIKey(apiKey string, w http.ResponseWriter, r *http.Request, logger waLog.Logger) bool {
-	if os.Getenv("WHATSAPP_MCP_DISABLE_AUTH") == "true" {
-		return true
-	}
-
-	if apiKey == "" {
-		http.Error(w, "API key is not configured", http.StatusInternalServerError)
-		return false
-	}
-
-	provided := ""
-	if auth := r.Header.Get("Authorization"); auth != "" {
-		if token, ok := strings.CutPrefix(auth, "Bearer "); ok {
-			provided = strings.TrimSpace(token)
-		}
-	}
-	if provided == "" {
-		provided = r.Header.Get(apiKeyHeader)
-	}
-
-	if provided == "" {
-		logger.Warnf("AUTHZ_DENIED")
-		http.Error(w, "Missing API key", http.StatusUnauthorized)
-		return false
-	}
-
-	if subtle.ConstantTimeCompare([]byte(provided), []byte(apiKey)) != 1 {
-		logger.Warnf("AUTHZ_DENIED")
-		http.Error(w, "Invalid API key", http.StatusUnauthorized)
-		return false
-	}
-
-	return true
-}
-
 // Store additional media info in the database
 func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
 	_, err := store.db.Exec(
@@ -1683,7 +1644,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, listenAddr string, apiKey string, tlsCertPath string, tlsKeyPath string, logger waLog.Logger) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, listenAddr string, tlsCertPath string, tlsKeyPath string, logger waLog.Logger) {
 
 	tlsEnabled := true
 	if os.Getenv("WHATSAPP_MCP_DISABLE_TLS") == "true" {
@@ -1740,16 +1701,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	}
 	tmpStore.startGC(context.Background(), 60*time.Second)
 
-	authWrap := func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !requireAPIKey(apiKey, w, r, logger) {
-				return
-			}
-			h.ServeHTTP(w, r)
-		})
-	}
-
-	mux.Handle(mediaPathPrefix+"/", authWrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle(mediaPathPrefix+"/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimPrefix(r.URL.Path, mediaPathPrefix+"/")
 		if id == "" || strings.Contains(id, "/") {
 			http.NotFound(w, r)
@@ -1776,7 +1728,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(data)
-	})))
+	}))
 
 	server := mcp.NewServer(&mcp.Implementation{Name: "whatsapp-remote", Version: "v1"}, nil)
 
@@ -2084,7 +2036,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	mcpHandler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return server
 	}, &mcp.StreamableHTTPOptions{SessionTimeout: 30 * time.Minute})
-	mux.Handle(mcpPath, authWrap(mcpHandler))
+	mux.Handle(mcpPath, mcpHandler)
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -2102,9 +2054,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 
 	// Handler for sending messages
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2150,9 +2099,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/search-contacts", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2176,9 +2122,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/list-chats", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2203,9 +2146,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/get-chat", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2235,9 +2175,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/get-direct-chat-by-contact", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2267,9 +2204,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/get-contact-chats", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2299,9 +2233,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/get-last-interaction", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2331,9 +2262,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/list-messages", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2358,9 +2286,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 	})
 
 	mux.HandleFunc("/api/get-message-context", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -2391,9 +2316,6 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, liste
 
 	// Handler for downloading media
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
-		if !requireAPIKey(apiKey, w, r, logger) {
-			return
-		}
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2469,10 +2391,6 @@ func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
-
-	if err := godotenv.Load(); err != nil {
-		logger.Infof("No .env file loaded: %v", err)
-	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
@@ -2588,12 +2506,6 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	apiKey := os.Getenv("WHATSAPP_MCP_API_KEY")
-	if apiKey == "" && os.Getenv("WHATSAPP_MCP_DISABLE_AUTH") != "true" {
-		logger.Errorf("WHATSAPP_MCP_API_KEY is not set; refusing to start server")
-		return
-	}
-
 	tlsCertPath := os.Getenv("WHATSAPP_MCP_TLS_CERT")
 	tlsKeyPath := os.Getenv("WHATSAPP_MCP_TLS_KEY")
 	if tlsCertPath == "" {
@@ -2609,7 +2521,7 @@ func main() {
 	}
 
 	// Start REST API server
-	startRESTServer(client, messageStore, listenAddr, apiKey, tlsCertPath, tlsKeyPath, logger)
+	startRESTServer(client, messageStore, listenAddr, tlsCertPath, tlsKeyPath, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

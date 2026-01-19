@@ -10,7 +10,7 @@ If you are reading this via `AGENTS.md` or `CLAUDE.md`, those files are pointers
 
 WhatsApp MCP Server: a Model Context Protocol (MCP) server for WhatsApp.
 
-Architecture: single-process Go system implemented under `whatsapp-bridge/`:
+Architecture: single-process Go system implemented at repo root:
 - Connects to WhatsApp via the WhatsApp Web multidevice API using whatsmeow
 - Stores chats/messages in SQLite
 - Exposes MCP over Streamable HTTP (default `/mcp`)
@@ -28,7 +28,7 @@ AI rule files:
 
 ## Build / Run / Lint / Test
 
-All Go commands should be run from `whatsapp-bridge/` (this directory contains `go.mod`).
+All Go commands should be run from the repo root (this directory contains `go.mod`).
 
 Run (recommended; generates self-signed TLS certs if missing):
 - `./launch.sh`
@@ -37,7 +37,7 @@ Run (direct; assumes certs exist and env vars are configured):
 - `go run main.go`
 
 Build:
-- `go build -o whatsapp-bridge main.go`
+- `go build -o whatsapp-mcp main.go`
 
 Format (required):
 - `go fmt ./...`
@@ -62,7 +62,7 @@ Lint / static checks:
 ## Environment Variables
 
 Required:
-- `WHATSAPP_MCP_API_KEY` (server refuses to start unless auth is disabled)
+- none
 
 Optional (common):
 - `WHATSAPP_MCP_LISTEN_ADDR` (default `:8080`)
@@ -74,15 +74,14 @@ Optional (common):
 - `WHATSAPP_MCP_TLS_KEY` (default `store/server.key`)
 
 Debug / escape hatches (use with care):
-- `WHATSAPP_MCP_DISABLE_AUTH=true` (disables auth checks)
-- `WHATSAPP_MCP_DISABLE_TLS=true` (disables TLS; only for local debugging)
+- `WHATSAPP_MCP_DISABLE_TLS=true` (recommended behind Cloudflare Tunnel)
 
 ---
 
 ## HTTP Endpoints
 
-- MCP: `GET/POST /mcp` (requires `Authorization: Bearer <API_KEY>`)
-- Media: `GET /media/{media_id}` (requires `Authorization: Bearer <API_KEY>`)
+- MCP: `GET/POST /mcp`
+- Media: `GET /media/{media_id}`
 - Health: `GET /healthz`
 - Readiness: `GET /readyz`
 
@@ -104,24 +103,23 @@ Tool names use underscores (not dots):
 ## Local End-to-End Smoke Test
 
 1) Start the server:
-- `cd whatsapp-bridge && ./launch.sh`
+- `./launch.sh`
 
 2) Validate HTTP endpoints (examples):
-- `curl -k https://localhost:8080/healthz`
-- `curl -k https://localhost:8080/readyz`
+- `curl http://localhost:8080/healthz`
+- `curl http://localhost:8080/readyz`
 
 3) Validate from your MCP client:
 - MCP endpoint is typically `/mcp`
-- Client should send `Authorization: Bearer <WHATSAPP_MCP_API_KEY>`
-- For media downloads: call `media_get_download_url` then `GET /media/{media_id}` with `Authorization: Bearer ...`
+- For media downloads: call `media_get_download_url` then `GET /media/{media_id}`
 
 ---
 
 ## Storage / Schema
 
-- Bridge state lives under `whatsapp-bridge/store/`.
-- WhatsApp session DB: `whatsapp-bridge/store/whatsapp.db`
-- Messages DB: `whatsapp-bridge/store/messages.db` (schema is created in code).
+- State lives under `store/`.
+- WhatsApp session DB: `store/whatsapp.db`
+- Messages DB: `store/messages.db` (schema is created in code).
 - Avoid schema changes unless you also plan a migration.
 
 Database tables (high level):
@@ -156,11 +154,8 @@ Error handling:
 - Prefer contextual wrapping: `fmt.Errorf("<what failed>: %v", err)`.
 - Close resources reliably (e.g. `defer rows.Close()`; close DB on init failure).
 
-HTTP / auth:
+HTTP:
 - HTTP endpoints are implemented with `net/http` handlers on a `ServeMux`.
-- Auth is centralized in `requireAPIKey`.
-  - Accepts either `Authorization: Bearer <key>` OR `X-API-Key: <key>`.
-  - Keep auth checks early in handlers.
 
 Concurrency and safety:
 - Protect shared mutable maps with `sync.RWMutex` (see tmp media index).
@@ -181,7 +176,7 @@ Concurrency and safety:
 Secrets and generated artifacts are intentionally gitignored:
 - `.env`
 - SQLite `*.db`
-- `whatsapp-bridge/store/` (includes session DBs and TLS cert/key)
+- `store/` (includes session DBs and TLS cert/key)
 
 Never commit API keys, `.env`, databases, or downloaded media.
 

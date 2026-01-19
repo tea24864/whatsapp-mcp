@@ -4,7 +4,7 @@
 
 - Replace the current two-process system (Go bridge + Python MCP adapter) with a single **remote** Go MCP server.
 - Use the official MCP Go SDK: https://github.com/modelcontextprotocol/go-sdk.
-- Authenticate all requests with `Authorization: Bearer <api-key>`.
+- Authentication is handled separately (not in v1).
 - Support a single WhatsApp identity (one QR pairing) and persist session state.
 - Provide **structured JSON** outputs (no legacy compatibility constraints).
 - Support media download via **temporary HTTPS URLs** and enforce **10 minute** retention.
@@ -18,7 +18,7 @@
 
 ## Current State (Baseline)
 
-- Go process (`whatsapp-bridge/`) maintains WhatsApp connection, SQLite stores, and exposes HTTPS `/api/*`.
+- Go process (repo root) maintains WhatsApp connection, SQLite stores, and exposes HTTPS `/api/*`.
 - Python process (`whatsapp-mcp-server/`) exposes MCP over stdio and proxies calls to the Go HTTPS API.
 
 Consolidation deletes the Python layer and hosts MCP directly in the Go service.
@@ -42,7 +42,7 @@ Consolidation deletes the Python layer and hosts MCP directly in the Go service.
 
 ### Authentication
 
-- Require `Authorization: Bearer <api-key>` for:
+- Require standard MCP auth (OAuth 2.1) for:
   - MCP endpoint (`/mcp`)
   - media endpoint (`/media/*`)
   - health endpoints (optional; can be unauthenticated if you prefer)
@@ -127,12 +127,11 @@ Data model notes:
 ### Endpoints
 
 - `GET /media/{media_id}`
-  - Requires `Authorization: Bearer <api-key>`.
   - Returns bytes with correct `Content-Type` and `Content-Disposition`.
 
 ### Storage
 
-- Store downloaded/fetched media under `whatsapp-bridge/store/tmp-media/` (or a new `store/tmp-media/` in consolidated layout).
+- Store downloaded/fetched media under `store/tmp-media/`.
 - Track metadata:
   - `media_id` (opaque random ID)
   - file path
@@ -162,7 +161,7 @@ Enforce retention:
 MCP handler:
 - Construct `mcp.Server`
 - Register tools
-- Wrap with auth middleware
+- Mount the handler
 - Serve via `mcp.NewStreamableHTTPHandler(getServer, opts)`
 
 ## Configuration
@@ -173,7 +172,7 @@ Add env vars (names are suggestions; pick consistent prefixes):
 - `WHATSAPP_MCP_BASE_URL` (default `https://www.teamsaid.com`)
 - `WHATSAPP_MCP_MCP_PATH` (default `/mcp`)
 - `WHATSAPP_MCP_MEDIA_PATH_PREFIX` (default `/media`)
-- `WHATSAPP_MCP_API_KEY` (required)
+- Authentication config TBD (OAuth 2.1)
 - `WHATSAPP_MCP_MEDIA_TTL_SECONDS` (default `600`)
 
 Keep WhatsApp-related config already used by bridge as needed.
@@ -184,27 +183,21 @@ Keep WhatsApp-related config already used by bridge as needed.
 - Route `Host(`www.teamsaid.com`) && PathPrefix(`/media`)` to Go backend.
 - Ensure streaming is not buffered for `/mcp`.
 - Increase idle timeouts for long-lived MCP sessions.
-- Pass through `Authorization` header.
+- Pass through headers required by MCP auth (TBD).
 
 ## Implementation Steps
 
 1. Repo restructure
    - Decide whether to:
-     - keep code under `whatsapp-bridge/` and delete `whatsapp-mcp-server/`, or
+     - keep code at repo root and delete `whatsapp-mcp-server/`, or
      - move bridge code into a new root Go module.
-   - Keep changes minimal: start by integrating MCP into `whatsapp-bridge/main.go`.
+   - Keep changes minimal: integrate MCP into `main.go`.
 
 2. Add MCP Go SDK
    - Add dependency `github.com/modelcontextprotocol/go-sdk/mcp`.
    - Add minimal MCP server initialization.
 
-3. Implement auth middleware
-   - Validate Bearer token equals configured API key.
-   - Wrap:
-     - MCP HTTP handler
-     - media HTTP handler
-
-4. Implement media store
+3. Implement media store
    - Temp file storage + metadata index.
    - TTL enforcement (10 min).
    - Background GC.

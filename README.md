@@ -33,10 +33,9 @@ Here's an example of what you can do when it's connected to Claude.
 
 2. **Run the server**
 
-   Navigate to the whatsapp-bridge directory and run the Go application:
+   Run the Go application:
 
    ```bash
-   cd whatsapp-bridge
    ./launch.sh
    ```
 
@@ -56,13 +55,8 @@ Here's an example of what you can do when it's connected to Claude.
 
    2) Start the WhatsApp MCP server in WSL:
 
-   ```bash
-   cd whatsapp-bridge
-
-   # Required in normal mode.
-   export WHATSAPP_MCP_API_KEY="devkey"
-
-   # Optional but recommended for correct media download URLs.
+```bash
+# Optional but recommended for correct media download URLs.
    # Set this later once you know the tunnel URL.
    # export WHATSAPP_MCP_BASE_URL="https://<your-tunnel-hostname>"
 
@@ -72,7 +66,7 @@ Here's an example of what you can do when it's connected to Claude.
    3) Start the tunnel from Windows (PowerShell). This will print a `https://...trycloudflare.com` URL:
 
    ```powershell
-   cloudflared tunnel --url https://localhost:8080 --no-tls-verify
+   cloudflared tunnel --url http://localhost:8080
    ```
 
    4) Set `WHATSAPP_MCP_BASE_URL` in WSL to the printed tunnel URL (so `media_get_download_url` returns reachable links), then restart the server:
@@ -85,26 +79,48 @@ Here's an example of what you can do when it's connected to Claude.
 
    - Settings -> Connectors -> Add custom connector
    - URL: `https://<your-tunnel-hostname>/mcp`
-   - Headers:
-     - `Authorization: Bearer devkey`
-
+   
    Tool names use underscore-only (no dots), e.g. `chats_list`, `messages_send_text`, `media_get_download_url`.
 
-### Windows + WSL Notes
+### Docker + Cloudflare Tunnel (Recommended)
 
-- The Go server is expected to run in WSL (Ubuntu) and be tunneled to Claude Desktop running on Windows.
-- `cloudflared` runs on Windows and forwards to the WSL server.
-- You do not need to compile Go on Windows for this workflow.
+This repo ships a `compose.yaml` that runs:
+- the Go MCP server (plain HTTP inside the Docker network)
+- a `cloudflared` sidecar that provides public HTTPS
+
+1) Create an env file (do not commit it):
+
+```bash
+cp compose.env.example .env
+```
+
+2) Fill in:
+- `WHATSAPP_MCP_BASE_URL` (your public https tunnel hostname)
+- `TUNNEL_TOKEN_WHATSAPP` (for a named tunnel)
+
+3) Start:
+
+```bash
+docker compose -f compose.yaml up -d
+```
+
+For quick-tunnel development (random `trycloudflare.com` hostname):
+
+```bash
+docker compose --profile quick up -d whatsapp-mcp cloudflared-quick
+```
+
+Note: quick tunnels are best-effort/dev only; use a named tunnel for stability.
 
 ## Architecture Overview
 
 This application is a single Go process:
 
-- **Go WhatsApp MCP Server** (`whatsapp-bridge/`): Connects to WhatsApp via whatsmeow, stores message history in SQLite, exposes MCP over Streamable HTTP at `/mcp`, and serves temporary media downloads at `/media/*`.
+- **Go WhatsApp MCP Server**: Connects to WhatsApp via whatsmeow, stores message history in SQLite, exposes MCP over Streamable HTTP at `/mcp`, and serves temporary media downloads at `/media/*`.
 
 ### Data Storage
 
-- All message history is stored in a SQLite database within the `whatsapp-bridge/store/` directory
+- All message history is stored in a SQLite database within the `store/` directory
 - The database maintains tables for chats and messages
 - Messages are indexed for efficient searching and retrieval
 
@@ -118,7 +134,7 @@ From Windows PowerShell, you can validate that the tunnel is up and the server i
 
 ```powershell
 curl.exe -vk https://<your-tunnel-hostname>/healthz
-curl.exe -vk -H "Authorization: Bearer devkey" -H "Accept: text/event-stream" https://<your-tunnel-hostname>/mcp
+curl.exe -vk -H "Accept: text/event-stream" https://<your-tunnel-hostname>/mcp
 ```
 
 ### MCP Tools
@@ -143,12 +159,11 @@ The server exposes a JSON-first toolset:
 
 1. Your MCP client connects to the Go server over HTTPS at `/mcp` (Streamable HTTP).
 2. The Go server queries the local SQLite database for reads and uses whatsmeow for WhatsApp operations.
-3. Media downloads are exposed as temporary URLs under `/media/*` and require `Authorization: Bearer <api-key>`.
+3. Media downloads are exposed as temporary URLs under `/media/*`.
 
 ## Troubleshooting
 
 - Make sure the Go server is running and connected to WhatsApp.
-- Ensure your MCP client is sending `Authorization: Bearer <WHATSAPP_MCP_API_KEY>`.
 
 ### Authentication Issues
 
@@ -156,6 +171,6 @@ The server exposes a JSON-first toolset:
 - **WhatsApp Already Logged In**: If your session is already active, the Go bridge will automatically reconnect without showing a QR code.
 - **Device Limit Reached**: WhatsApp limits the number of linked devices. If you reach this limit, you'll need to remove an existing device from WhatsApp on your phone (Settings > Linked Devices).
 - **No Messages Loading**: After initial authentication, it can take several minutes for your message history to load, especially if you have many chats.
-- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the bridge, delete both database files (`whatsapp-bridge/store/messages.db` and `whatsapp-bridge/store/whatsapp.db`) and restart the bridge to re-authenticate.
+- **WhatsApp Out of Sync**: If your WhatsApp messages get out of sync with the server, delete both database files (`store/messages.db` and `store/whatsapp.db`) and restart to re-authenticate.
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.

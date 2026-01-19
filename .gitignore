@@ -1,12 +1,19 @@
 *.db
+*.db-wal
+*.db-shm
+
 .env
 claude_desktop_config.json
 whatsapp.log
 .claude/
+.ruff_cache/
 
-# SQLite WAL sidecars (local, regenerated)
-store/*.db-wal
-store/*.db-shm
+# Runtime state (never commit)
+store/
+store-root-backup-*/
 
-whatsapp-bridge/store/
-whatsapp-bridge/whatsapp-client
+# Build outputs
+whatsapp-mcp
+
+# Container artifacts
+.env

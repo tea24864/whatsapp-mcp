@@ -1,0 +1,48 @@
+services:
+  whatsapp-mcp:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      WHATSAPP_MCP_LISTEN_ADDR: ":8080"
+      WHATSAPP_MCP_DISABLE_TLS: "true"
+      WHATSAPP_MCP_BASE_URL: ${WHATSAPP_MCP_BASE_URL}
+    volumes:
+      - ./store:/app/store
+    tmpfs:
+      - /app/store/tmp-media
+    ports:
+      - "8080:8080"
+
+  cloudflared-whatsapp:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      whatsapp-mcp:
+        condition: service_started
+    command: >-
+      tunnel --no-autoupdate --metrics 127.0.0.1:60123
+      run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN_WHATSAPP}
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:60123", "ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  cloudflared-quick:
+    profiles: ["quick"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - whatsapp-mcp
+    command: tunnel --no-autoupdate --url http://whatsapp-mcp:8080
+
