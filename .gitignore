@@ -3,5 +3,10 @@
 claude_desktop_config.json
 whatsapp.log
 .claude/
-whatsapp-bridge/store/server.crt
-whatsapp-bridge/store/server.key
+
+# SQLite WAL sidecars (local, regenerated)
+store/*.db-wal
+store/*.db-shm
+
+whatsapp-bridge/store/
+whatsapp-bridge/whatsapp-client

@@ -8,15 +8,19 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
+	"strconv"
 
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +35,8 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Message represents a chat message for our client
@@ -908,6 +914,124 @@ func extractTextContent(msg *waProto.Message) string {
 
 const apiKeyHeader = "X-API-Key"
 
+const defaultListenAddr = ":8080"
+const defaultMCPPath = "/mcp"
+const defaultMediaPathPrefix = "/media"
+const defaultMediaTTLSeconds = 600
+
+type tmpMediaMeta struct {
+	Path         string
+	MimeType     string
+	Filename     string
+	ExpiresAt    time.Time
+	SizeBytes    int64
+	DownloadedAt time.Time
+}
+
+type tmpMediaStore struct {
+	Dir string
+	TTL time.Duration
+	mu  sync.RWMutex
+	idx map[string]tmpMediaMeta
+}
+
+func newTmpMediaStore(dir string, ttl time.Duration) (*tmpMediaStore, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create tmp media directory: %v", err)
+	}
+	return &tmpMediaStore{Dir: dir, TTL: ttl, idx: make(map[string]tmpMediaMeta)}, nil
+}
+
+func (s *tmpMediaStore) putFile(filename string, mimeType string, data []byte) (string, tmpMediaMeta, error) {
+	if filename == "" {
+		filename = "file"
+	}
+	id := fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63())
+	path := filepath.Join(s.Dir, id)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return "", tmpMediaMeta{}, err
+	}
+	meta := tmpMediaMeta{
+		Path:         path,
+		MimeType:     mimeType,
+		Filename:     filename,
+		ExpiresAt:    time.Now().Add(s.TTL),
+		SizeBytes:    int64(len(data)),
+		DownloadedAt: time.Now(),
+	}
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.idx[id] = meta
+	}()
+	return id, meta, nil
+}
+
+func (s *tmpMediaStore) get(id string) (tmpMediaMeta, bool) {
+	s.mu.RLock()
+	meta, ok := s.idx[id]
+	s.mu.RUnlock()
+	if !ok {
+		return tmpMediaMeta{}, false
+	}
+	if time.Now().After(meta.ExpiresAt) {
+		s.mu.Lock()
+		delete(s.idx, id)
+		s.mu.Unlock()
+		_ = os.Remove(meta.Path)
+		return tmpMediaMeta{}, false
+	}
+	return meta, true
+}
+
+func (s *tmpMediaStore) gcOnce() {
+	now := time.Now()
+	var expired []string
+
+	s.mu.RLock()
+	for id, meta := range s.idx {
+		if now.After(meta.ExpiresAt) {
+			expired = append(expired, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, id := range expired {
+		meta, ok := s.idx[id]
+		if !ok {
+			continue
+		}
+		if now.After(meta.ExpiresAt) {
+			_ = os.Remove(meta.Path)
+			delete(s.idx, id)
+		}
+	}
+}
+
+func (s *tmpMediaStore) startGC(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.gcOnce()
+			}
+		}
+	}()
+}
+
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
@@ -1333,12 +1457,25 @@ type GetMessageContextResponse struct {
 }
 
 func requireAPIKey(apiKey string, w http.ResponseWriter, r *http.Request, logger waLog.Logger) bool {
+	if os.Getenv("WHATSAPP_MCP_DISABLE_AUTH") == "true" {
+		return true
+	}
+
 	if apiKey == "" {
 		http.Error(w, "API key is not configured", http.StatusInternalServerError)
 		return false
 	}
 
-	provided := r.Header.Get(apiKeyHeader)
+	provided := ""
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if token, ok := strings.CutPrefix(auth, "Bearer "); ok {
+			provided = strings.TrimSpace(token)
+		}
+	}
+	if provided == "" {
+		provided = r.Header.Get(apiKeyHeader)
+	}
+
 	if provided == "" {
 		logger.Warnf("AUTHZ_DENIED")
 		http.Error(w, "Missing API key", http.StatusUnauthorized)
@@ -1546,23 +1683,425 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, apiKey string, tlsCertPath string, tlsKeyPath string, logger waLog.Logger) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, listenAddr string, apiKey string, tlsCertPath string, tlsKeyPath string, logger waLog.Logger) {
+
+	tlsEnabled := true
+	if os.Getenv("WHATSAPP_MCP_DISABLE_TLS") == "true" {
+		tlsEnabled = false
+	}
 	if tlsCertPath == "" || tlsKeyPath == "" {
-		fmt.Println("TLS certificate or key path is missing; HTTPS server not started")
-		return
+		tlsEnabled = false
+	}
+	if tlsEnabled {
+		if _, err := os.Stat(tlsCertPath); err != nil {
+			fmt.Printf("TLS certificate not found at %s: %v\n", tlsCertPath, err)
+			return
+		}
+		if _, err := os.Stat(tlsKeyPath); err != nil {
+			fmt.Printf("TLS key not found at %s: %v\n", tlsKeyPath, err)
+			return
+		}
 	}
 
-	if _, err := os.Stat(tlsCertPath); err != nil {
-		fmt.Printf("TLS certificate not found at %s: %v\n", tlsCertPath, err)
-		return
+	mux := http.NewServeMux()
+
+	mcpPath := os.Getenv("WHATSAPP_MCP_MCP_PATH")
+	if mcpPath == "" {
+		mcpPath = defaultMCPPath
 	}
 
-	if _, err := os.Stat(tlsKeyPath); err != nil {
-		fmt.Printf("TLS key not found at %s: %v\n", tlsKeyPath, err)
+	mediaPathPrefix := os.Getenv("WHATSAPP_MCP_MEDIA_PATH_PREFIX")
+	if mediaPathPrefix == "" {
+		mediaPathPrefix = defaultMediaPathPrefix
+	}
+
+	baseURL := os.Getenv("WHATSAPP_MCP_BASE_URL")
+	if baseURL == "" {
+		scheme := "https"
+		if !tlsEnabled {
+			scheme = "http"
+		}
+		baseURL = scheme + "://localhost" + listenAddr
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	mediaTTLSeconds := defaultMediaTTLSeconds
+	if v := os.Getenv("WHATSAPP_MCP_MEDIA_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			mediaTTLSeconds = n
+		}
+	}
+	mediaTTL := time.Duration(mediaTTLSeconds) * time.Second
+
+	tmpStore, err := newTmpMediaStore(filepath.Join("store", "tmp-media"), mediaTTL)
+	if err != nil {
+		fmt.Printf("Failed to init tmp media store: %v\n", err)
 		return
 	}
+	tmpStore.startGC(context.Background(), 60*time.Second)
+
+	authWrap := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !requireAPIKey(apiKey, w, r, logger) {
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
+
+	mux.Handle(mediaPathPrefix+"/", authWrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, mediaPathPrefix+"/")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		meta, ok := tmpStore.get(id)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		data, err := os.ReadFile(meta.Path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+
+		if meta.MimeType != "" {
+			w.Header().Set("Content-Type", meta.MimeType)
+		}
+		if meta.Filename != "" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", meta.Filename))
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+	})))
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "whatsapp-remote", Version: "v1"}, nil)
+
+	mcp.AddTool(server, &mcp.Tool{Name: "chats_list"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		Query  string `json:"query,omitempty"`
+		Limit  int    `json:"limit,omitempty"`
+		Cursor string `json:"cursor,omitempty"`
+	}) (*mcp.CallToolResult, any, error) {
+		limit := normalizeLimit(in.Limit, 20, 100)
+		page := 0
+		if in.Cursor != "" {
+			if n, err := strconv.Atoi(in.Cursor); err == nil && n >= 0 {
+				page = n
+			} else {
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "invalid cursor"}}, IsError: true}, nil, nil
+			}
+		}
+
+		chats, err := messageStore.ListChats(in.Query, limit, page, true, "")
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("database error: %v", err)}}, IsError: true}, nil, nil
+		}
+
+		nextCursor := ""
+		if len(chats) == limit {
+			nextCursor = strconv.Itoa(page + 1)
+		}
+
+		out := map[string]any{
+			"chats":       chats,
+			"next_cursor": nextCursor,
+		}
+		if nextCursor == "" {
+			delete(out, "next_cursor")
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "chats_resolve_recipient"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		PhoneNumber string `json:"phone_number"`
+	}) (*mcp.CallToolResult, any, error) {
+		phone := strings.TrimSpace(in.PhoneNumber)
+		phone = strings.TrimPrefix(phone, "+")
+		if phone == "" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "phone_number is required"}}, IsError: true}, nil, nil
+		}
+
+		chat, err := messageStore.GetDirectChatByContact(phone)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("database error: %v", err)}}, IsError: true}, nil, nil
+		}
+		if chat == nil {
+			cands, err := messageStore.SearchContacts(phone)
+			if err != nil {
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "recipient not found"}}, IsError: true}, nil, nil
+			}
+			out := map[string]any{
+				"candidates": cands,
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "recipient not found or ambiguous"}}, IsError: true}, out, nil
+		}
+
+		return nil, map[string]any{"chat_jid": chat.JID, "match_type": "normalized"}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "messages_list"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		ChatJID string `json:"chat_jid"`
+		Limit   int    `json:"limit,omitempty"`
+		Before  string `json:"before,omitempty"`
+		After   string `json:"after,omitempty"`
+		Query   string `json:"query,omitempty"`
+	}) (*mcp.CallToolResult, any, error) {
+		if in.ChatJID == "" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "chat_jid is required"}}, IsError: true}, nil, nil
+		}
+		limit := normalizeLimit(in.Limit, 20, 100)
+		req2 := ListMessagesRequest{ChatJID: in.ChatJID, Limit: limit, Before: in.Before, After: in.After, Query: in.Query, Page: 0, IncludeContext: false}
+		msgs, err := messageStore.ListMessages(req2)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("database error: %v", err)}}, IsError: true}, nil, nil
+		}
+		return nil, map[string]any{"messages": msgs}, nil
+	})
+
+	resolveChatJID := func(chatJID string, phoneNumber string) (string, map[string]any, *mcp.CallToolResult) {
+		if chatJID != "" {
+			return chatJID, nil, nil
+		}
+		phone := strings.TrimSpace(phoneNumber)
+		phone = strings.TrimPrefix(phone, "+")
+		if phone == "" {
+			return "", nil, &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "chat_jid or phone_number is required"}}, IsError: true}
+		}
+		chat, err := messageStore.GetDirectChatByContact(phone)
+		if err == nil && chat != nil {
+			return chat.JID, nil, nil
+		}
+		cands, _ := messageStore.SearchContacts(phone)
+		out := map[string]any{"candidates": cands}
+		return "", out, &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "recipient not found or ambiguous"}}, IsError: true}
+	}
+
+	mcp.AddTool(server, &mcp.Tool{Name: "messages_send_text"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		ChatJID     string `json:"chat_jid,omitempty"`
+		PhoneNumber string `json:"phone_number,omitempty"`
+		Text        string `json:"text"`
+	}) (*mcp.CallToolResult, any, error) {
+		if strings.TrimSpace(in.Text) == "" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "text is required"}}, IsError: true}, nil, nil
+		}
+		chatJID, errOut, errRes := resolveChatJID(in.ChatJID, in.PhoneNumber)
+		if errRes != nil {
+			return errRes, errOut, nil
+		}
+
+		jid, err := types.ParseJID(chatJID)
+		if err != nil {
+			jid = types.JID{User: strings.SplitN(chatJID, "@", 2)[0], Server: "s.whatsapp.net"}
+		}
+		resp, err := client.SendMessage(ctx, jid, &waProto.Message{Conversation: proto.String(in.Text)})
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: err.Error()}}, IsError: true}, nil, nil
+		}
+		return nil, map[string]any{"message_id": string(resp.ID), "status": "sent"}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "messages_send_media_from_url"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		ChatJID     string `json:"chat_jid,omitempty"`
+		PhoneNumber string `json:"phone_number,omitempty"`
+		URL         string `json:"url"`
+		Filename    string `json:"filename,omitempty"`
+		MimeType    string `json:"mime_type,omitempty"`
+		Caption     string `json:"caption,omitempty"`
+	}) (*mcp.CallToolResult, any, error) {
+		if in.URL == "" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "url is required"}}, IsError: true}, nil, nil
+		}
+		chatJID, errOut, errRes := resolveChatJID(in.ChatJID, in.PhoneNumber)
+		if errRes != nil {
+			return errRes, errOut, nil
+		}
+
+		resp, err := http.Get(in.URL)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("fetch failed: %v", err)}}, IsError: true}, nil, nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("fetch failed with status %d", resp.StatusCode)}}, IsError: true}, nil, nil
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "failed to read response"}}, IsError: true}, nil, nil
+		}
+
+		mimeType := in.MimeType
+		if mimeType == "" {
+			mimeType = resp.Header.Get("Content-Type")
+		}
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		filename := in.Filename
+		if filename == "" {
+			filename = filepath.Base(strings.SplitN(in.URL, "?", 2)[0])
+		}
+
+		mediaType := whatsmeow.MediaDocument
+		switch {
+		case strings.HasPrefix(mimeType, "image/"):
+			mediaType = whatsmeow.MediaImage
+		case strings.HasPrefix(mimeType, "video/"):
+			mediaType = whatsmeow.MediaVideo
+		case strings.HasPrefix(mimeType, "audio/"):
+			mediaType = whatsmeow.MediaAudio
+		}
+
+		upl, err := client.Upload(ctx, data, mediaType)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("upload failed: %v", err)}}, IsError: true}, nil, nil
+		}
+
+		jid, err := types.ParseJID(chatJID)
+		if err != nil {
+			jid = types.JID{User: strings.SplitN(chatJID, "@", 2)[0], Server: "s.whatsapp.net"}
+		}
+
+		msg := &waProto.Message{}
+		switch mediaType {
+		case whatsmeow.MediaImage:
+			msg.ImageMessage = &waProto.ImageMessage{Caption: proto.String(in.Caption), Mimetype: proto.String(mimeType), URL: &upl.URL, DirectPath: &upl.DirectPath, MediaKey: upl.MediaKey, FileEncSHA256: upl.FileEncSHA256, FileSHA256: upl.FileSHA256, FileLength: &upl.FileLength}
+		case whatsmeow.MediaVideo:
+			msg.VideoMessage = &waProto.VideoMessage{Caption: proto.String(in.Caption), Mimetype: proto.String(mimeType), URL: &upl.URL, DirectPath: &upl.DirectPath, MediaKey: upl.MediaKey, FileEncSHA256: upl.FileEncSHA256, FileSHA256: upl.FileSHA256, FileLength: &upl.FileLength}
+		case whatsmeow.MediaAudio:
+			msg.AudioMessage = &waProto.AudioMessage{Mimetype: proto.String(mimeType), URL: &upl.URL, DirectPath: &upl.DirectPath, MediaKey: upl.MediaKey, FileEncSHA256: upl.FileEncSHA256, FileSHA256: upl.FileSHA256, FileLength: &upl.FileLength, PTT: proto.Bool(false)}
+		default:
+			msg.DocumentMessage = &waProto.DocumentMessage{Title: proto.String(filename), Caption: proto.String(in.Caption), Mimetype: proto.String(mimeType), URL: &upl.URL, DirectPath: &upl.DirectPath, MediaKey: upl.MediaKey, FileEncSHA256: upl.FileEncSHA256, FileSHA256: upl.FileSHA256, FileLength: &upl.FileLength, FileName: proto.String(filename)}
+		}
+
+		sendResp, err := client.SendMessage(ctx, jid, msg)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("send failed: %v", err)}}, IsError: true}, nil, nil
+		}
+		return nil, map[string]any{"message_id": string(sendResp.ID), "status": "sent"}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "messages_send_voice_ogg_from_url"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		ChatJID     string `json:"chat_jid,omitempty"`
+		PhoneNumber string `json:"phone_number,omitempty"`
+		URL         string `json:"url"`
+	}) (*mcp.CallToolResult, any, error) {
+		if in.URL == "" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "url is required"}}, IsError: true}, nil, nil
+		}
+		if !strings.HasSuffix(strings.ToLower(strings.SplitN(in.URL, "?", 2)[0]), ".ogg") {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "voice messages must be Opus/Ogg (.ogg)"}}, IsError: true}, nil, nil
+		}
+		chatJID, errOut, errRes := resolveChatJID(in.ChatJID, in.PhoneNumber)
+		if errRes != nil {
+			return errRes, errOut, nil
+		}
+
+		resp, err := http.Get(in.URL)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("fetch failed: %v", err)}}, IsError: true}, nil, nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("fetch failed with status %d", resp.StatusCode)}}, IsError: true}, nil, nil
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "failed to read response"}}, IsError: true}, nil, nil
+		}
+
+		upl, err := client.Upload(ctx, data, whatsmeow.MediaAudio)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("upload failed: %v", err)}}, IsError: true}, nil, nil
+		}
+
+		seconds, waveform, err := analyzeOggOpus(data)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("invalid ogg/opus: %v", err)}}, IsError: true}, nil, nil
+		}
+
+		jid, err := types.ParseJID(chatJID)
+		if err != nil {
+			jid = types.JID{User: strings.SplitN(chatJID, "@", 2)[0], Server: "s.whatsapp.net"}
+		}
+
+		mimeType := "audio/ogg; codecs=opus"
+		msg := &waProto.Message{AudioMessage: &waProto.AudioMessage{Mimetype: proto.String(mimeType), URL: &upl.URL, DirectPath: &upl.DirectPath, MediaKey: upl.MediaKey, FileEncSHA256: upl.FileEncSHA256, FileSHA256: upl.FileSHA256, FileLength: &upl.FileLength, Seconds: proto.Uint32(seconds), PTT: proto.Bool(true), Waveform: waveform}}
+		sendResp, err := client.SendMessage(ctx, jid, msg)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("send failed: %v", err)}}, IsError: true}, nil, nil
+		}
+		return nil, map[string]any{"message_id": string(sendResp.ID), "status": "sent"}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "media_get_download_url"}, func(ctx context.Context, req *mcp.CallToolRequest, in struct {
+		ChatJID   string `json:"chat_jid"`
+		MessageID string `json:"message_id"`
+	}) (*mcp.CallToolResult, any, error) {
+		if in.ChatJID == "" || in.MessageID == "" {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "chat_jid and message_id are required"}}, IsError: true}, nil, nil
+		}
+		success, mediaType, filename, path, err := downloadMedia(client, messageStore, in.MessageID, in.ChatJID)
+		_ = mediaType
+		if !success || err != nil {
+			msg := "failed to download media"
+			if err != nil {
+				msg = err.Error()
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: msg}}, IsError: true}, nil, nil
+		}
+
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "failed to read downloaded file"}}, IsError: true}, nil, nil
+		}
+
+		mimeType := "application/octet-stream"
+		if mt := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); mt != "" {
+			mimeType = mt
+		}
+
+		mediaID, meta, err := tmpStore.putFile(filename, mimeType, data)
+		if err != nil {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "failed to store tmp media"}}, IsError: true}, nil, nil
+		}
+
+		url := fmt.Sprintf("%s%s/%s", baseURL, mediaPathPrefix, mediaID)
+		out := map[string]any{
+			"url":        url,
+			"expires_at": meta.ExpiresAt.UTC().Format(time.RFC3339Nano),
+			"media": map[string]any{
+				"filename":   filename,
+				"mime_type":  mimeType,
+				"size_bytes": meta.SizeBytes,
+			},
+		}
+		return nil, out, nil
+	})
+
+	mcpHandler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
+		return server
+	}, &mcp.StreamableHTTPOptions{SessionTimeout: 30 * time.Minute})
+	mux.Handle(mcpPath, authWrap(mcpHandler))
+
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if client != nil && client.IsConnected() {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready"))
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("not ready"))
+	})
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1610,7 +2149,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	http.HandleFunc("/api/search-contacts", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/search-contacts", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1636,7 +2175,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(SearchContactsResponse{Success: true, Contacts: contacts})
 	})
 
-	http.HandleFunc("/api/list-chats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/list-chats", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1663,7 +2202,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(ListChatsResponse{Success: true, Chats: chats})
 	})
 
-	http.HandleFunc("/api/get-chat", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/get-chat", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1695,7 +2234,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(GetChatResponse{Success: true, Chat: chat})
 	})
 
-	http.HandleFunc("/api/get-direct-chat-by-contact", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/get-direct-chat-by-contact", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1727,7 +2266,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(GetDirectChatByContactResponse{Success: true, Chat: chat})
 	})
 
-	http.HandleFunc("/api/get-contact-chats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/get-contact-chats", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1759,7 +2298,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(GetContactChatsResponse{Success: true, Chats: chats})
 	})
 
-	http.HandleFunc("/api/get-last-interaction", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/get-last-interaction", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1791,7 +2330,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(GetLastInteractionResponse{Success: true, Last: last})
 	})
 
-	http.HandleFunc("/api/list-messages", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/list-messages", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1818,7 +2357,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		json.NewEncoder(w).Encode(ListMessagesResponse{Success: true, Messages: messages})
 	})
 
-	http.HandleFunc("/api/get-message-context", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/get-message-context", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1851,7 +2390,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		if !requireAPIKey(apiKey, w, r, logger) {
 			return
 		}
@@ -1905,13 +2444,23 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on https://localhost%s...\n", serverAddr)
+	serverAddr := listenAddr
+	if tlsEnabled {
+		fmt.Printf("Starting server on https://localhost%s...\n", serverAddr)
+	} else {
+		fmt.Printf("Starting server on http://localhost%s...\n", serverAddr)
+	}
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServeTLS(serverAddr, tlsCertPath, tlsKeyPath, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+		var err error
+		if tlsEnabled {
+			err = http.ListenAndServeTLS(serverAddr, tlsCertPath, tlsKeyPath, mux)
+		} else {
+			err = http.ListenAndServe(serverAddr, mux)
+		}
+		if err != nil {
+			fmt.Printf("Server error: %v\n", err)
 		}
 	}()
 }
@@ -2039,14 +2588,14 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	apiKey := os.Getenv("WHATSAPP_BRIDGE_API_KEY")
-	if apiKey == "" {
-		logger.Errorf("WHATSAPP_BRIDGE_API_KEY is not set; refusing to start REST API server")
+	apiKey := os.Getenv("WHATSAPP_MCP_API_KEY")
+	if apiKey == "" && os.Getenv("WHATSAPP_MCP_DISABLE_AUTH") != "true" {
+		logger.Errorf("WHATSAPP_MCP_API_KEY is not set; refusing to start server")
 		return
 	}
 
-	tlsCertPath := os.Getenv("WHATSAPP_BRIDGE_TLS_CERT")
-	tlsKeyPath := os.Getenv("WHATSAPP_BRIDGE_TLS_KEY")
+	tlsCertPath := os.Getenv("WHATSAPP_MCP_TLS_CERT")
+	tlsKeyPath := os.Getenv("WHATSAPP_MCP_TLS_KEY")
 	if tlsCertPath == "" {
 		tlsCertPath = "store/server.crt"
 	}
@@ -2054,8 +2603,13 @@ func main() {
 		tlsKeyPath = "store/server.key"
 	}
 
+	listenAddr := os.Getenv("WHATSAPP_MCP_LISTEN_ADDR")
+	if listenAddr == "" {
+		listenAddr = defaultListenAddr
+	}
+
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080, apiKey, tlsCertPath, tlsKeyPath, logger)
+	startRESTServer(client, messageStore, listenAddr, apiKey, tlsCertPath, tlsKeyPath, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
