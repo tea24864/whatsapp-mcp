@@ -2,9 +2,9 @@
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
-With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
+With this you can search and read your personal WhatsApp messages (including images, videos, documents, and audio messages), search your contacts, and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
 
-It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
+It connects to your **personal WhatsApp account** directly via the WhatsApp Web multi-device API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
 
 Here's an example of what you can do when it's connected to Claude.
 
@@ -14,12 +14,15 @@ Here's an example of what you can do when it's connected to Claude.
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
+> *Warning:* this project is a work in progress. The intended setup is to run the MCP server remotely with OAuth2 in front of it; local/dev setup details may change.
+
 ## Installation
 
 ### Prerequisites
 
 - Go
 - Anthropic Claude Desktop app
+- OpenSSL (used by `./launch.sh` to generate a self-signed TLS cert)
 - FFmpeg (_optional_) - Only needed if you want to convert audio to Opus/Ogg before sending voice messages.
 
 ### Steps
@@ -27,7 +30,7 @@ Here's an example of what you can do when it's connected to Claude.
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/lharries/whatsapp-mcp.git
+   git clone https://github.com/tea24864/whatsapp-mcp.git
    cd whatsapp-mcp
    ```
 
@@ -39,13 +42,19 @@ Here's an example of what you can do when it's connected to Claude.
    ./launch.sh
    ```
 
+   By default, the server:
+   - listens on `:8080`
+   - serves MCP at `/mcp`
+   - serves temporary media downloads at `/media/<id>`
+   - uses TLS with a self-signed cert (generated under `store/`)
+
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
-   After approximately 20 days, you may need to re-authenticate.
+   WhatsApp may require re-authentication periodically.
 
 3. **Connect Claude Desktop (Windows) via Cloudflare Tunnel**
 
-   Claude Desktop "Connectors" require a publicly reachable HTTPS URL (localhost URLs are rejected), so for local development we tunnel the WSL server using Cloudflare.
+   If your MCP client requires a publicly reachable HTTPS URL (for example, Claude Desktop custom connectors), tunnel your local server using Cloudflare.
 
    1) Install cloudflared (Windows PowerShell):
 
@@ -53,10 +62,13 @@ Here's an example of what you can do when it's connected to Claude.
    winget install -e --id Cloudflare.cloudflared
    ```
 
-   2) Start the WhatsApp MCP server in WSL:
+   2) Start the WhatsApp MCP server in WSL (recommended: disable local TLS behind the tunnel):
 
-```bash
-# Optional but recommended for correct media download URLs.
+   ```bash
+   # Serve plain HTTP locally; Cloudflare provides HTTPS publicly.
+   export WHATSAPP_MCP_DISABLE_TLS="true"
+
+   # Optional but recommended for correct media download URLs.
    # Set this later once you know the tunnel URL.
    # export WHATSAPP_MCP_BASE_URL="https://<your-tunnel-hostname>"
 
@@ -112,11 +124,33 @@ docker compose --profile quick up -d whatsapp-mcp cloudflared-quick
 
 Note: quick tunnels are best-effort/dev only; use a named tunnel for stability.
 
+### Configuration
+
+All configuration is via environment variables:
+
+- `WHATSAPP_MCP_LISTEN_ADDR` (default `:8080`)
+- `WHATSAPP_MCP_MCP_PATH` (default `/mcp`)
+- `WHATSAPP_MCP_MEDIA_PATH_PREFIX` (default `/media`)
+- `WHATSAPP_MCP_MEDIA_TTL_SECONDS` (default `600`)
+- `WHATSAPP_MCP_BASE_URL` (default `https://localhost:<port>`; set this when tunneling so media URLs are reachable)
+- `WHATSAPP_MCP_DISABLE_TLS=true` (serve plain HTTP; recommended behind Cloudflare Tunnel)
+- `WHATSAPP_MCP_TLS_CERT` (default `store/server.crt`)
+- `WHATSAPP_MCP_TLS_KEY` (default `store/server.key`)
+
 ## Architecture Overview
 
 This application is a single Go process:
 
 - **Go WhatsApp MCP Server**: Connects to WhatsApp via whatsmeow, stores message history in SQLite, exposes MCP over Streamable HTTP at `/mcp`, and serves temporary media downloads at `/media/*`.
+
+### HTTP Endpoints
+
+- MCP: `GET/POST /mcp` (Streamable HTTP)
+- Media: `GET /media/<id>` (temporary downloads)
+- Health: `GET /healthz`
+- Readiness: `GET /readyz`
+
+There are also some legacy/debug REST endpoints under `/api/*` (JSON POST) used for direct interaction outside MCP.
 
 ### Data Storage
 
@@ -139,31 +173,32 @@ curl.exe -vk -H "Accept: text/event-stream" https://<your-tunnel-hostname>/mcp
 
 ### MCP Tools
 
-The server exposes a JSON-first toolset:
+Tool names use underscores (not dots):
 
-- `chats.list`
-- `chats.resolve_recipient`
-- `messages.list`
-- `messages.send_text`
-- `messages.send_media_from_url`
-- `messages.send_voice_ogg_from_url`
-- `media.get_download_url`
+- `chats_list`
+- `chats_resolve_recipient`
+- `messages_list`
+- `messages_send_text`
+- `messages_send_media_from_url`
+- `messages_send_voice_ogg_from_url`
+- `media_get_download_url`
 
 ### Media Handling
 
-- Sending media: `messages.send_media_from_url` fetches the URL server-side and sends it.
-- Sending voice notes: `messages.send_voice_ogg_from_url` only accepts Opus/Ogg.
-- Downloading media: `media.get_download_url` returns a temporary HTTPS URL under `/media/*` that expires (default 10 minutes).
+- Sending media: `messages_send_media_from_url` fetches the URL server-side and sends it.
+- Sending voice notes: `messages_send_voice_ogg_from_url` requires an `.ogg` URL (Opus-in-Ogg).
+- Downloading media: `media_get_download_url` returns a temporary URL under `/media/<id>` that expires (default 10 minutes).
 
 ## Technical Details
 
-1. Your MCP client connects to the Go server over HTTPS at `/mcp` (Streamable HTTP).
+1. Your MCP client connects to the Go server over HTTP(S) at `/mcp` (Streamable HTTP).
 2. The Go server queries the local SQLite database for reads and uses whatsmeow for WhatsApp operations.
-3. Media downloads are exposed as temporary URLs under `/media/*`.
+3. Media downloads are exposed as temporary URLs under `/media/<id>`.
 
 ## Troubleshooting
 
 - Make sure the Go server is running and connected to WhatsApp.
+- If you are tunneling via Cloudflare and used `cloudflared tunnel --url http://localhost:8080`, set `WHATSAPP_MCP_DISABLE_TLS=true` before starting the server.
 
 ### Authentication Issues
 
